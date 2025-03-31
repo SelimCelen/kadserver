@@ -291,15 +291,10 @@ func (dm *DiscoveryManager) advertiseService(ctx context.Context) {
 }
 
 func (dm *DiscoveryManager) findPeers(ctx context.Context) {
-	ticker := time.NewTicker(5)
+	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
+	for {peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
 			if err != nil {
 				dm.logger.Error("Failed to find peers", zap.Error(err))
 				continue
@@ -312,7 +307,7 @@ func (dm *DiscoveryManager) findPeers(ctx context.Context) {
 				dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
 				dm.logger.Debug("Discovered peer", zap.String("peer", p.ID.String()))
 			}
-		}
+
 	}
 }
 
