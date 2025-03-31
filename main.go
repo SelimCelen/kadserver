@@ -291,7 +291,7 @@ func (dm *DiscoveryManager) advertiseService(ctx context.Context) {
 }
 
 func (dm *DiscoveryManager) findPeers(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(5)
 	defer ticker.Stop()
 
 	for {
