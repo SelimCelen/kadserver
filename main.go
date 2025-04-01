@@ -291,12 +291,12 @@ func (dm *DiscoveryManager) advertiseService(ctx context.Context) {
 }
 
 func (dm *DiscoveryManager) findPeers(ctx context.Context) {
-	ticker := time.NewTicker(time.Millisecond)
+	ticker := time.NewTicker(time.Nanosecond)
 	defer ticker.Stop()
 
 	for {peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
 			if err != nil {
-				dm.logger.Error("Failed to find peers", zap.Error(err))
+				dm.logger.Info("Failed to find peers", zap.Error(err))
 				continue
 			}
 
@@ -305,7 +305,7 @@ func (dm *DiscoveryManager) findPeers(ctx context.Context) {
 					continue
 				}
 				dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
-				dm.logger.Debug("Discovered peer", zap.String("peer", p.ID.String()))
+				dm.logger.Info("Discovered peer", zap.String("peer", p.ID.String()))
 			}
 
 	}
@@ -826,8 +826,22 @@ func (c *Config) Save(path string) error {
 	}
 	return nil
 }
+func main(){
+	 var wg sync.WaitGroup
 
-func main() {
+    for i := 0; i <= 1; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            Init()
+        }()
+    }
+
+    wg.Wait() // Wait for all goroutines to finish
+
+    fmt.Println("All goroutines have completed.")
+}
+func Init() {
 	logger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
