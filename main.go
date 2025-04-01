@@ -19,12 +19,12 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/libp2p/go-libp2p"
+	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
-	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	routingdiscovery "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
@@ -44,7 +44,7 @@ const (
 	stateSaveInterval  = 5 * time.Minute
 	stateSaveTimeout   = 10 * time.Second
 	stateRetryInterval = 1 * time.Minute
-	version           = "1.0.0"
+	version            = "1.0.0"
 )
 
 type Config struct {
@@ -58,12 +58,12 @@ type Config struct {
 }
 
 type NodeState struct {
-	PeerID        string   `json:"peerId"`
-	ListenAddrs   []string `json:"listenAddrs"`
+	PeerID         string   `json:"peerId"`
+	ListenAddrs    []string `json:"listenAddrs"`
 	ConnectedPeers []string `json:"connectedPeers"`
-	DHTBuckets    []string `json:"dhtBuckets"`
-	LastUpdated   int64    `json:"lastUpdated"`
-	Version       string   `json:"version"`
+	DHTBuckets     []string `json:"dhtBuckets"`
+	LastUpdated    int64    `json:"lastUpdated"`
+	Version        string   `json:"version"`
 }
 
 type StateManager struct {
@@ -102,12 +102,12 @@ func (sm *StateManager) SaveState(h host.Host, dht *kaddht.IpfsDHT) error {
 	}
 
 	sm.state = NodeState{
-		PeerID:        h.ID().String(),
-		ListenAddrs:   multiaddrListToStrings(h.Addrs()),
+		PeerID:         h.ID().String(),
+		ListenAddrs:    multiaddrListToStrings(h.Addrs()),
 		ConnectedPeers: peerIDs,
-		DHTBuckets:    buckets,
-		LastUpdated:   time.Now().Unix(),
-		Version:       version,
+		DHTBuckets:     buckets,
+		LastUpdated:    time.Now().Unix(),
+		Version:        version,
 	}
 
 	tempPath := filepath.Join(sm.config.DataDir, stateFileName+".tmp")
@@ -294,19 +294,20 @@ func (dm *DiscoveryManager) findPeers(ctx context.Context) {
 	ticker := time.NewTicker(time.Nanosecond)
 	defer ticker.Stop()
 
-	for {peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
-			if err != nil {
-				dm.logger.Info("Failed to find peers", zap.Error(err))
+	for {
+		peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
+		if err != nil {
+			dm.logger.Info("Failed to find peers", zap.Error(err))
+			continue
+		}
+
+		for p := range peerChan {
+			if p.ID == dm.host.ID() {
 				continue
 			}
-
-			for p := range peerChan {
-				if p.ID == dm.host.ID() {
-					continue
-				}
-				dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
-				dm.logger.Info("Discovered peer", zap.String("peer", p.ID.String()))
-			}
+			dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
+			dm.logger.Info("Discovered peer", zap.String("peer", p.ID.String()))
+		}
 
 	}
 }
@@ -607,7 +608,7 @@ func (kr *KademliaRelay) setupAPI() *mux.Router {
 func (kr *KademliaRelay) listPeersHandler(w http.ResponseWriter, r *http.Request) {
 	peers := kr.host.Network().Peers()
 	peerInfos := make([]peer.AddrInfo, 0, len(peers))
-	
+
 	for _, p := range peers {
 		peerInfos = append(peerInfos, peer.AddrInfo{
 			ID:    p,
@@ -653,8 +654,8 @@ func (kr *KademliaRelay) nodeInfoHandler(w http.ResponseWriter, r *http.Request)
 		"protocols":  kr.host.Mux().Protocols(),
 		"peersCount": len(kr.host.Network().Peers()),
 		"relay": map[string]interface{}{
-			"enabled":      kr.config.EnableRelay,
-			"connections":  kr.connStats.relay.Load(),
+			"enabled":     kr.config.EnableRelay,
+			"connections": kr.connStats.relay.Load(),
 		},
 		"dht": map[string]interface{}{
 			"routingTableSize": kr.dht.RoutingTable().Size(),
@@ -667,10 +668,10 @@ func (kr *KademliaRelay) nodeInfoHandler(w http.ResponseWriter, r *http.Request)
 
 func (kr *KademliaRelay) relayStatusHandler(w http.ResponseWriter, r *http.Request) {
 	status := map[string]interface{}{
-		"enabled":       kr.config.EnableRelay,
-		"autoRelay":     kr.config.EnableAutoRelay,
-		"activeRelays":  kr.connStats.relay.Load(),
-		"isRelay":       kr.relay != nil,
+		"enabled":      kr.config.EnableRelay,
+		"autoRelay":    kr.config.EnableAutoRelay,
+		"activeRelays": kr.connStats.relay.Load(),
+		"isRelay":      kr.relay != nil,
 	}
 
 	respondWithJSON(w, http.StatusOK, status)
@@ -764,12 +765,12 @@ type mdnsNotifee struct {
 
 func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	n.logger.Info("Discovered peer via mDNS", zap.String("peer", pi.ID.String()))
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	if err := n.h.Connect(ctx, pi); err != nil {
-		n.logger.Error("Failed to connect to discovered peer", 
+		n.logger.Error("Failed to connect to discovered peer",
 			zap.String("peer", pi.ID.String()),
 			zap.Error(err),
 		)
@@ -792,7 +793,7 @@ func DefaultConfig() *Config {
 		EnableAutoRelay: true,
 		APIPort:         5000,
 		PrivateKeyPath:  "identity.key",
-		DataDir:        "data",
+		DataDir:         "data",
 	}
 }
 
@@ -826,10 +827,10 @@ func (c *Config) Save(path string) error {
 	}
 	return nil
 }
-func main(){
+func main() {
 	Init()
 }
-//export
+
 func Init() {
 	logger, err := zap.NewProduction()
 	if err != nil {
