@@ -353,7 +353,7 @@ func NewKademliaRelay(ctx context.Context, cfg *Config, logger *zap.Logger) (*Ka
 		return nil, fmt.Errorf("private key error: %w", err)
 	}
 
-	connMgr, err := connmgr.NewConnManager(100, 1000, connmgr.WithGracePeriod(time.Minute))
+	connMgr, err := connmgr.NewConnManager(300, 5000, connmgr.WithGracePeriod(time.Minute))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("connection manager error: %w", err)
@@ -606,7 +606,7 @@ func (kr *KademliaRelay) connectBootstrapPeers() {
 			kr.logger.Info("Connected to bootstrap peer",
 				zap.String("peer", pi.ID.String()),
 			)
-			kr.host.ConnManager().Protect(pi.ID, "bootstrap")
+			kr.host.ConnManager().Protect(pi.ID, "important")
 			return nil
 		})
 	}
@@ -891,6 +891,8 @@ func DefaultConfig() *Config {
 		BootstrapPeers: []string{
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+			"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+                        "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 		},
 		EnableRelay:             true,
 		EnableAutoRelay:         true,
