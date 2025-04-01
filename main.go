@@ -827,20 +827,9 @@ func (c *Config) Save(path string) error {
 	return nil
 }
 func main(){
-	 var wg sync.WaitGroup
-
-    for i := 0; i <= 1; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            Init()
-        }()
-    }
-
-    wg.Wait() // Wait for all goroutines to finish
-
-    fmt.Println("All goroutines have completed.")
+	Init()
 }
+//export
 func Init() {
 	logger, err := zap.NewProduction()
 	if err != nil {
