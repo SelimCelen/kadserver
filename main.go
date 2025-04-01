@@ -37,24 +37,28 @@ import (
 )
 
 const (
-	stateFileName      = "krelay-state.json"
-	stateBackupPrefix  = "krelay-state-"
-	configFileName     = "config.json"
-	maxStateBackups    = 5
-	stateSaveInterval  = 5 * time.Minute
-	stateSaveTimeout   = 10 * time.Second
-	stateRetryInterval = 1 * time.Minute
-	version            = "1.0.0"
+	stateFileName          = "krelay-state.json"
+	stateBackupPrefix      = "krelay-state-"
+	configFileName         = "config.json"
+	maxStateBackups        = 5
+	stateSaveInterval      = 5 * time.Minute
+	stateSaveTimeout       = 10 * time.Second
+	stateRetryInterval     = 1 * time.Minute
+	peerstoreCleanInterval = 1 * time.Hour
+	peerstoreTTL           = 24 * time.Hour
+	version                = "1.0.0"
 )
 
 type Config struct {
-	ListenAddrs     []string `json:"listenAddrs"`
-	BootstrapPeers  []string `json:"bootstrapPeers"`
-	EnableRelay     bool     `json:"enableRelay"`
-	EnableAutoRelay bool     `json:"enableAutoRelay"`
-	APIPort         int      `json:"apiPort"`
-	PrivateKeyPath  string   `json:"privateKeyPath"`
-	DataDir         string   `json:"dataDir"`
+	ListenAddrs             []string `json:"listenAddrs"`
+	BootstrapPeers          []string `json:"bootstrapPeers"`
+	EnableRelay             bool     `json:"enableRelay"`
+	EnableAutoRelay         bool     `json:"enableAutoRelay"`
+	APIPort                 int      `json:"apiPort"`
+	PrivateKeyPath          string   `json:"privateKeyPath"`
+	DataDir                 string   `json:"dataDir"`
+	PeerstoreCleanupEnabled bool     `json:"peerstoreCleanupEnabled"`
+	PeerstoreCleanupInterval string `json:"peerstoreCleanupInterval"`
 }
 
 type NodeState struct {
@@ -308,7 +312,6 @@ func (dm *DiscoveryManager) findPeers(ctx context.Context) {
 			dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
 			dm.logger.Info("Discovered peer", zap.String("peer", p.ID.String()))
 		}
-
 	}
 }
 
@@ -327,6 +330,7 @@ type KademliaRelay struct {
 		total atomic.Int32
 		relay atomic.Int32
 	}
+	lastSeen sync.Map // Thread-safe map for tracking last seen times
 }
 
 func NewKademliaRelay(ctx context.Context, cfg *Config, logger *zap.Logger) (*KademliaRelay, error) {
@@ -483,6 +487,14 @@ func (kr *KademliaRelay) Start() error {
 	kr.discovery.Start(kr.ctx)
 	go kr.connectBootstrapPeers()
 
+	if kr.config.PeerstoreCleanupEnabled {
+		interval, err := time.ParseDuration(kr.config.PeerstoreCleanupInterval)
+		if err != nil {
+			interval = peerstoreCleanInterval
+		}
+		go kr.schedulePeerstoreCleanup(interval)
+	}
+
 	go func() {
 		kr.logger.Info("API server starting", zap.String("addr", kr.apiServer.Addr))
 		if err := kr.apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -491,6 +503,75 @@ func (kr *KademliaRelay) Start() error {
 	}()
 
 	return nil
+}
+
+func (kr *KademliaRelay) schedulePeerstoreCleanup(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-kr.ctx.Done():
+			return
+		case <-ticker.C:
+			kr.cleanupPeerstore()
+		}
+	}
+}
+
+func (kr *KademliaRelay) cleanupPeerstore() {
+	connectedPeers := kr.host.Network().Peers()
+	allPeers := kr.host.Peerstore().Peers()
+	now := time.Now()
+
+	var cleaned int
+	for _, p := range allPeers {
+		// Skip connected peers
+		if containsPeer(connectedPeers, p) {
+			continue
+		}
+
+		// Skip protected peers (bootstrap nodes, etc)
+		if kr.host.ConnManager().IsProtected(p, "") {
+			continue
+		}
+
+		// Check last seen time from our sync.Map
+		if lastSeen, ok := kr.lastSeen.Load(p); ok {
+			if now.Sub(lastSeen.(time.Time)) > peerstoreTTL {
+				// Clean addresses by setting them to temporary
+				addrs := kr.host.Peerstore().Addrs(p)
+				for _, addr := range addrs {
+					kr.host.Peerstore().AddAddr(p, addr, peerstore.TempAddrTTL)
+				}
+				
+				// Clean protocols
+				protos, err := kr.host.Peerstore().GetProtocols(p)
+				if err == nil {
+					for _, proto := range protos {
+						kr.host.Peerstore().RemoveProtocols(p, proto)
+					}
+				}
+				
+				cleaned++
+			}
+		}
+	}
+
+	if cleaned > 0 {
+		kr.logger.Info("Cleaned peerstore",
+			zap.Int("peers", cleaned),
+			zap.Int("remaining", len(allPeers)))
+	}
+}
+
+func containsPeer(peers []peer.ID, target peer.ID) bool {
+	for _, p := range peers {
+		if p == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (kr *KademliaRelay) connectBootstrapPeers() {
@@ -566,6 +647,9 @@ func (kr *KademliaRelay) onConnected(_ network.Network, c network.Conn) {
 	peerID := c.RemotePeer()
 	direction := c.Stat().Direction
 
+	// Update last seen time in our sync.Map
+	kr.lastSeen.Store(peerID, time.Now())
+
 	kr.connStats.total.Add(1)
 	if direction == network.DirInbound && kr.relay != nil {
 		kr.connStats.relay.Add(1)
@@ -580,6 +664,9 @@ func (kr *KademliaRelay) onConnected(_ network.Network, c network.Conn) {
 func (kr *KademliaRelay) onDisconnected(_ network.Network, c network.Conn) {
 	peerID := c.RemotePeer()
 	direction := c.Stat().Direction
+
+	// Update last seen time in our sync.Map
+	kr.lastSeen.Store(peerID, time.Now())
 
 	kr.connStats.total.Add(-1)
 	if direction == network.DirInbound && kr.relay != nil {
@@ -601,8 +688,22 @@ func (kr *KademliaRelay) setupAPI() *mux.Router {
 	r.HandleFunc("/api/v1/config", kr.getConfigHandler).Methods("GET")
 	r.HandleFunc("/api/v1/config", kr.updateConfigHandler).Methods("PUT")
 	r.HandleFunc("/api/v1/save", kr.saveStateHandler).Methods("POST")
+	r.HandleFunc("/api/v1/peerstore", kr.peerstoreInfoHandler).Methods("GET")
 
 	return r
+}
+
+func (kr *KademliaRelay) peerstoreInfoHandler(w http.ResponseWriter, r *http.Request) {
+	peers := kr.host.Peerstore().Peers()
+	connected := kr.host.Network().Peers()
+
+	info := map[string]interface{}{
+		"totalPeers":     len(peers),
+		"connectedPeers": len(connected),
+		"cleanupEnabled": kr.config.PeerstoreCleanupEnabled,
+	}
+
+	respondWithJSON(w, http.StatusOK, info)
 }
 
 func (kr *KademliaRelay) listPeersHandler(w http.ResponseWriter, r *http.Request) {
@@ -696,6 +797,8 @@ func (kr *KademliaRelay) updateConfigHandler(w http.ResponseWriter, r *http.Requ
 	kr.config.APIPort = newConfig.APIPort
 	kr.config.EnableRelay = newConfig.EnableRelay
 	kr.config.EnableAutoRelay = newConfig.EnableAutoRelay
+	kr.config.PeerstoreCleanupEnabled = newConfig.PeerstoreCleanupEnabled
+	kr.config.PeerstoreCleanupInterval = newConfig.PeerstoreCleanupInterval
 
 	if err := kr.config.Save(filepath.Join(kr.config.DataDir, configFileName)); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "failed to save config")
@@ -789,11 +892,13 @@ func DefaultConfig() *Config {
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
 		},
-		EnableRelay:     true,
-		EnableAutoRelay: true,
-		APIPort:         5000,
-		PrivateKeyPath:  "identity.key",
-		DataDir:         "data",
+		EnableRelay:             true,
+		EnableAutoRelay:         true,
+		APIPort:                 5000,
+		PrivateKeyPath:          "identity.key",
+		DataDir:                 "data",
+		PeerstoreCleanupEnabled: true,
+		PeerstoreCleanupInterval: "1h",
 	}
 }
 
@@ -827,11 +932,8 @@ func (c *Config) Save(path string) error {
 	}
 	return nil
 }
-func main() {
-	Init()
-}
 
-func Init() {
+func main() {
 	logger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
