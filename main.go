@@ -277,8 +277,8 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 	}
 
 	go dm.advertiseService(ctx)
-	go dm.findPeers(ctx)
-}
+        go dm.findPeers(ctx)
+	}
 
 func (dm *DiscoveryManager) advertiseService(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
@@ -295,10 +295,9 @@ func (dm *DiscoveryManager) advertiseService(ctx context.Context) {
 }
 
 func (dm *DiscoveryManager) findPeers(ctx context.Context) {
-	ticker := time.NewTicker(time.Nanosecond)
-	defer ticker.Stop()
+	
 
-	for {
+	for range time.Tick(time.Minute) {
 		peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
 		if err != nil {
 			dm.logger.Info("Failed to find peers", zap.Error(err))
@@ -309,8 +308,8 @@ func (dm *DiscoveryManager) findPeers(ctx context.Context) {
 			if p.ID == dm.host.ID() {
 				continue
 			}
-			dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
-			dm.logger.Info("Discovered peer", zap.String("peer", p.ID.String()))
+			 dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
+			 dm.logger.Info("Discovered peer", zap.String("peer", p.ID.String()))
 		}
 	}
 }
@@ -353,7 +352,7 @@ func NewKademliaRelay(ctx context.Context, cfg *Config, logger *zap.Logger) (*Ka
 		return nil, fmt.Errorf("private key error: %w", err)
 	}
 
-	connMgr, err := connmgr.NewConnManager(300, 5000, connmgr.WithGracePeriod(time.Minute))
+	connMgr, err := connmgr.NewConnManager(200, 1000, connmgr.WithGracePeriod(2 * time.Hour))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("connection manager error: %w", err)
