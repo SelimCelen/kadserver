@@ -1,6 +1,7 @@
 package main
 
 import (
+
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -16,7 +17,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
+	tcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	webtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
+	webrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+        websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/gorilla/mux"
 	"github.com/libp2p/go-libp2p"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
@@ -29,7 +34,7 @@ import (
 	routingdiscovery "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
-	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	//"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 	"go.uber.org/zap"
@@ -297,7 +302,7 @@ func (dm *DiscoveryManager) advertiseService(ctx context.Context) {
 func (dm *DiscoveryManager) findPeers(ctx context.Context) {
 	
 
-	for range time.Tick(time.Minute) {
+	for range time.Tick(time.Second) {
 		peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
 		if err != nil {
 			dm.logger.Info("Failed to find peers", zap.Error(err))
@@ -352,19 +357,24 @@ func NewKademliaRelay(ctx context.Context, cfg *Config, logger *zap.Logger) (*Ka
 		return nil, fmt.Errorf("private key error: %w", err)
 	}
 
-	connMgr, err := connmgr.NewConnManager(200, 1000, connmgr.WithGracePeriod(2 * time.Hour))
+	/*, err := connmgr.NewConnManager(200, 1000, connmgr.WithGracePeriod(2 * time.Hour))
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("connection manager error: %w", err)
+		return niconnMgrl, fmt.Errorf("connection manager error: %w", err)
 	}
-
+         */
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.NATPortMap(),
 		libp2p.EnableNATService(),
-		libp2p.ConnectionManager(connMgr),
 		libp2p.EnableHolePunching(),
+		libp2p.ForceReachabilityPublic(),
+		libp2p.Transport(websocket.New),
+		libp2p.Transport(webrtc.New),
+		libp2p.Transport(webtransport.New),
+		libp2p.Transport(quic.NewTransport),
+		libp2p.Transport(tcp.NewTCPTransport),
 	}
 
 	if cfg.EnableRelay {
