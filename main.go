@@ -1,9 +1,10 @@
 package main
 
 import (
-	"encoding/binary"
+
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+        "container/list"
 
 	"github.com/gorilla/mux"
 	"github.com/libp2p/go-libp2p"
@@ -30,16 +32,17 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	routingdiscovery "github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	kb "github.com/libp2p/go-libp2p-kbucket"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -55,9 +58,14 @@ const (
 	stateRetryInterval     = 1 * time.Minute
 	peerstoreCleanInterval = 1 * time.Hour
 	peerstoreTTL           = 24 * time.Hour
-	version                = "1.2.0"
+	version                = "1.3.0"
 	negotiationProtocol    = "/krelay/negotiation/1.0.0"
+	peerExchangeProtocol   = "/krelay/peer-exchange/1.0.0"
+	pingProtocol           = "/krelay/ping/1.0.0"
 	defaultMaxConnections  = 1000
+	discoveryCacheSize     = 1000
+	peerAdvertisementTTL   = 30 * time.Minute
+	optimizedLookupTimeout = 15 * time.Second
 )
 
 // ConnectionPriority defines connection priority levels
@@ -84,6 +92,7 @@ type Config struct {
 	ProtocolCapabilities     []ProtocolCapability `json:"protocolCapabilities"`
 	MaxConnections           int                  `json:"maxConnections"`
 	PubSub                   PubSubConfig         `json:"pubsub"`
+	EnableEnhancedDiscovery  bool                 `json:"enableEnhancedDiscovery"`
 }
 
 type PubSubConfig struct {
@@ -107,23 +116,223 @@ type NodeState struct {
 	Version        string   `json:"version"`
 }
 
-
 type PubSubManager struct {
-    host       host.Host
-    ps         *pubsub.PubSub
-    logger     *zap.Logger
-    topics     map[string]*pubsub.Topic
-    topicsMx   sync.RWMutex
-    subs       map[string]*pubsub.Subscription
-    cancelFuncs map[string]context.CancelFunc
-}
-type PubSubMessage struct {
-    From    peer.ID
-    Topic   string
-    Content []byte
-    Seq     int64  // Changed to int64
+	host        host.Host
+	ps          *pubsub.PubSub
+	logger      *zap.Logger
+	topics      map[string]*pubsub.Topic
+	topicsMx    sync.RWMutex
+	subs        map[string]*pubsub.Subscription
+	cancelFuncs map[string]context.CancelFunc
 }
 
+type PubSubMessage struct {
+	From    peer.ID
+	Topic   string
+	Content []byte
+	Seq     int64
+}
+
+type peerCacheEntry struct {
+	addrs      []multiaddr.Multiaddr
+	expiresAt  time.Time
+	discovered time.Time
+	listElem  *list.Element
+	value     *peerCacheEntryData
+}
+
+type DiscoveryManager struct {
+    host         host.Host
+    dht          *kaddht.IpfsDHT
+    mdns         mdns.Service
+    rd           *routingdiscovery.RoutingDiscovery
+    logger       *zap.Logger
+    peerCache    *PeerCache // Changed from lru.Cache to our own implementation
+    peerCacheMx  sync.Mutex
+    bootstrapped atomic.Bool
+    peerFilter   func(peer.AddrInfo) bool
+}
+type PeerCache struct {
+    cache  map[peer.ID]*peerCacheEntry
+    list   *list.List
+    maxSize int
+    mutex  sync.Mutex
+}
+
+
+
+type peerCacheEntryData struct {
+    addrs      []multiaddr.Multiaddr
+
+    discovered time.Time
+}
+
+func NewPeerCache(maxSize int) *PeerCache {
+    return &PeerCache{
+        cache:   make(map[peer.ID]*peerCacheEntry),
+        list:    list.New(),
+        maxSize: maxSize,
+    }
+}
+
+func (pc *PeerCache) Add(key peer.ID, value *peerCacheEntryData, ttl time.Duration) {
+    pc.mutex.Lock()
+    defer pc.mutex.Unlock()
+
+    // Remove if already exists
+    if entry, exists := pc.cache[key]; exists {
+        pc.list.Remove(entry.listElem)
+        delete(pc.cache, key)
+    }
+
+    // Remove oldest if at max size
+   /* if pc.list.Len() >= pc.maxSize {
+        oldest := pc.list.Back()
+        if oldest != nil {
+            entry := oldest.Value.(*peerCacheEntry)
+            delete(pc.cache, entry.value.addrs[0].ValueForProtocol(multiaddr.P_P2P))
+            pc.list.Remove(oldest)
+        }
+    }
+    */
+    // Add new entry
+    expiresAt := time.Now().Add(ttl)
+    entry := &peerCacheEntry{
+        value:     value,
+        expiresAt: expiresAt,
+    }
+    entry.listElem = pc.list.PushFront(entry)
+    pc.cache[key] = entry
+}
+
+func (pc *PeerCache) Get(key peer.ID) (*peerCacheEntryData, bool) {
+    pc.mutex.Lock()
+    defer pc.mutex.Unlock()
+
+    entry, exists := pc.cache[key]
+    if !exists {
+        return nil, false
+    }
+
+    // Check if expired
+    if time.Now().After(entry.expiresAt) {
+        pc.list.Remove(entry.listElem)
+        delete(pc.cache, key)
+        return nil, false
+    }
+
+    // Move to front (LRU)
+    pc.list.MoveToFront(entry.listElem)
+
+    return entry.value, true
+}
+
+func (pc *PeerCache) Remove(key peer.ID) {
+    pc.mutex.Lock()
+    defer pc.mutex.Unlock()
+
+    if entry, exists := pc.cache[key]; exists {
+        pc.list.Remove(entry.listElem)
+        delete(pc.cache, key)
+    }
+}
+
+func (pc *PeerCache) Keys() []peer.ID {
+    pc.mutex.Lock()
+    defer pc.mutex.Unlock()
+
+    keys := make([]peer.ID, 0, len(pc.cache))
+    for key := range pc.cache {
+        keys = append(keys, key)
+    }
+    return keys
+}
+
+func (pc *PeerCache) CleanExpired() {
+    pc.mutex.Lock()
+    defer pc.mutex.Unlock()
+
+    now := time.Now()
+    for key, entry := range pc.cache {
+        if now.After(entry.expiresAt) {
+            pc.list.Remove(entry.listElem)
+            delete(pc.cache, key)
+        }
+    }
+}
+type mdnsNotifee struct {
+	h      host.Host
+	logger *zap.Logger
+}
+
+type BridgeMapping struct {
+	ProtocolA      protocol.ID
+	ProtocolB      protocol.ID
+	HandlerA       network.StreamHandler
+	HandlerB       network.StreamHandler
+	Active         bool
+	SuccessCount   uint64
+	FailureCount   uint64
+	AvgLatency     time.Duration
+	LastUsed       time.Time
+}
+
+type ProtocolBridge struct {
+	host         host.Host
+	logger       *zap.Logger
+	bridges      map[string]*BridgeMapping
+	bridgesLock  sync.RWMutex
+	capabilities []ProtocolCapability
+}
+
+type ConnectionScore struct {
+	PeerID           peer.ID
+	LastActivity     time.Time
+	BytesTransferred uint64
+	Latency         time.Duration
+	Stability       float64
+	Priority        ConnectionPriority
+}
+
+type ConnectionManager struct {
+	host              host.Host
+	logger            *zap.Logger
+	maxConnections    int
+	priorityPeers     map[peer.ID]ConnectionPriority
+	connectionLimiter chan struct{}
+	maintenanceTicker *time.Ticker
+	metrics           struct {
+		totalConnections    atomic.Int32
+		inboundConnections  atomic.Int32
+		outboundConnections atomic.Int32
+	}
+	scoreMutex sync.Mutex
+}
+
+type StateManager struct {
+	config       *Config
+	logger       *zap.Logger
+	state        NodeState
+	stateMutex   sync.RWMutex
+	lastSaveTime time.Time
+}
+
+type KademliaRelay struct {
+	host        host.Host
+	dht         *kaddht.IpfsDHT
+	discovery   *DiscoveryManager
+	bridge      *ProtocolBridge
+	relay       *relay.Relay
+	pubsub      *PubSubManager
+	config      *Config
+	logger      *zap.Logger
+	ctx         context.Context
+	cancel      context.CancelFunc
+	apiServer   *http.Server
+	stateMgr    *StateManager
+	connManager *ConnectionManager
+	lastSeen    sync.Map
+}
 
 func NewPubSubManager(ctx context.Context, h host.Host, logger *zap.Logger) (*PubSubManager, error) {
 	ps, err := pubsub.NewGossipSub(ctx, h)
@@ -132,11 +341,12 @@ func NewPubSubManager(ctx context.Context, h host.Host, logger *zap.Logger) (*Pu
 	}
 
 	return &PubSubManager{
-		host:   h,
-		ps:     ps,
-		logger: logger,
-		topics: make(map[string]*pubsub.Topic),
-		subs:   make(map[string]*pubsub.Subscription),
+		host:        h,
+		ps:          ps,
+		logger:      logger,
+		topics:      make(map[string]*pubsub.Topic),
+		subs:        make(map[string]*pubsub.Subscription),
+		cancelFuncs: make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -178,6 +388,11 @@ func (pm *PubSubManager) LeaveTopic(topic string) error {
 		delete(pm.subs, topic)
 	}
 
+	if cancel, exists := pm.cancelFuncs[topic]; exists {
+		cancel()
+		delete(pm.cancelFuncs, topic)
+	}
+
 	pm.logger.Info("Left pubsub topic", zap.String("topic", topic))
 	return nil
 }
@@ -195,64 +410,63 @@ func (pm *PubSubManager) Publish(topic string, data []byte) error {
 }
 
 func (pm *PubSubManager) Subscribe(topic string, handler func(*PubSubMessage)) error {
-    pm.topicsMx.Lock()
-    defer pm.topicsMx.Unlock()
+	pm.topicsMx.Lock()
+	defer pm.topicsMx.Unlock()
 
-    if _, exists := pm.subs[topic]; exists {
-        return nil
-    }
+	if _, exists := pm.subs[topic]; exists {
+		return nil
+	}
 
-    if err := pm.JoinTopic(topic); err != nil {
-        return err
-    }
+	if err := pm.JoinTopic(topic); err != nil {
+		return err
+	}
 
-    t := pm.topics[topic]
-    sub, err := t.Subscribe()
-    if err != nil {
-        return fmt.Errorf("failed to subscribe to topic %s: %w", topic, err)
-    }
+	t := pm.topics[topic]
+	sub, err := t.Subscribe()
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to topic %s: %w", topic, err)
+	}
 
-    ctx, cancel := context.WithCancel(context.Background())
-    pm.subs[topic] = sub
-    pm.cancelFuncs[topic] = cancel
+	ctx, cancel := context.WithCancel(context.Background())
+	pm.subs[topic] = sub
+	pm.cancelFuncs[topic] = cancel
 
-    go func() {
-        for {
-            msg, err := sub.Next(ctx)
-            if err != nil {
-                if errors.Is(err, context.Canceled) {
-                    return
-                }
-                pm.logger.Error("Subscription error",
-                    zap.String("topic", topic),
-                    zap.Error(err))
-                continue
-            }
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				pm.logger.Error("Subscription error",
+					zap.String("topic", topic),
+					zap.Error(err))
+				continue
+			}
 
-            // Handle sequence number conversion safely
-            seqBytes := msg.GetSeqno()
-            var seqNo uint64
-            if len(seqBytes) >= 8 {
-                seqNo = binary.BigEndian.Uint64(seqBytes)
-            } else {
-                // Handle case where sequence number is not 8 bytes
-                pm.logger.Warn("Invalid sequence number length",
-                    zap.Int("length", len(seqBytes)))
-                seqNo = 0
-            }
+			seqBytes := msg.GetSeqno()
+			var seqNo uint64
+			if len(seqBytes) >= 8 {
+				seqNo = binary.BigEndian.Uint64(seqBytes)
+			} else {
+				pm.logger.Warn("Invalid sequence number length",
+					zap.Int("length", len(seqBytes)))
+				seqNo = 0
+			}
 
-            handler(&PubSubMessage{
-                From:    msg.GetFrom(),
-                Topic:   topic,
-                Content: msg.GetData(),
-                Seq:     int64(seqNo),
-            })
-        }
-    }()
+			handler(&PubSubMessage{
+				From:    msg.GetFrom(),
+				Topic:   topic,
+				Content: msg.GetData(),
+				Seq:     int64(seqNo),
+			})
+		}
+	}()
 
-    pm.logger.Info("Subscribed to pubsub topic", zap.String("topic", topic))
-    return nil
+	pm.logger.Info("Subscribed to pubsub topic", zap.String("topic", topic))
+	return nil
 }
+
 func (pm *PubSubManager) ListTopics() []string {
 	pm.topicsMx.RLock()
 	defer pm.topicsMx.RUnlock()
@@ -275,12 +489,428 @@ func (pm *PubSubManager) GetTopicPeers(topic string) []peer.ID {
 	return t.ListPeers()
 }
 
-type StateManager struct {
-	config       *Config
-	logger       *zap.Logger
-	state        NodeState
-	stateMutex   sync.RWMutex
-	lastSaveTime time.Time
+func NewDiscoveryManager(h host.Host, dht *kaddht.IpfsDHT, logger *zap.Logger) *DiscoveryManager {
+
+	return &DiscoveryManager{
+		host:       h,
+		dht:        dht,
+		mdns:       mdns.NewMdnsService(h, "krelay-enhanced", &mdnsNotifee{h: h, logger: logger}),
+		rd:         routingdiscovery.NewRoutingDiscovery(dht),
+		logger:     logger,
+		peerCache:   NewPeerCache(discoveryCacheSize),
+		peerFilter: defaultPeerFilter,
+	}
+}
+
+func defaultPeerFilter(pi peer.AddrInfo) bool {
+	for _, addr := range pi.Addrs {
+		if manet.IsPrivateAddr(addr) && !isDevMode() {
+			return false
+		}
+	}
+	return true
+}
+
+func isDevMode() bool {
+	return os.Getenv("DEV_MODE") == "1"
+}
+
+func (dm *DiscoveryManager) Start(ctx context.Context) {
+	if err := dm.mdns.Start(); err != nil {
+		dm.logger.Error("Failed to start mDNS", zap.Error(err))
+	}
+
+	go dm.runOptimizedDHTDiscovery(ctx)
+	go dm.runPeerExchange(ctx)
+	go dm.runPeerCacheMaintenance(ctx)
+	go dm.runLatencyBasedDiscovery(ctx)
+	go dm.monitorNetworkQuality(ctx)
+}
+
+func (dm *DiscoveryManager) runOptimizedDHTDiscovery(ctx context.Context) {
+	dm.bootstrappedDiscovery(ctx)
+
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if dm.bootstrapped.Load() {
+				dm.efficientFindPeers(ctx)
+			} else {
+				dm.bootstrappedDiscovery(ctx)
+			}
+		}
+	}
+}
+
+func (dm *DiscoveryManager) bootstrappedDiscovery(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, optimizedLookupTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	services := []string{
+		"krelay-service",
+		"krelay-peers",
+		"krelay-bridges",
+		"libp2p-relay",
+	}
+
+	for _, service := range services {
+		wg.Add(1)
+		go func(svc string) {
+			defer wg.Done()
+			dm.findAndConnectPeers(ctx, svc, 20)
+		}(service)
+	}
+
+	wg.Wait()
+	dm.bootstrapped.Store(true)
+}
+
+func (dm *DiscoveryManager) findAndConnectPeers(ctx context.Context, service string, limit int) {
+	peerChan, err := dm.rd.FindPeers(ctx, service)
+	if err != nil {
+		dm.logger.Info("Failed to find peers", zap.Error(err))
+		return
+	}
+
+	count := 0
+	for pi := range peerChan {
+		if count >= limit {
+			return
+		}
+
+		if pi.ID == dm.host.ID() || !dm.peerFilter(pi) {
+			continue
+		}
+
+		dm.processDiscoveredPeer(pi)
+		if err := dm.host.Connect(ctx, pi); err == nil {
+			count++
+		}
+	}
+}
+
+func (dm *DiscoveryManager) efficientFindPeers(ctx context.Context) {
+	rt := dm.dht.RoutingTable()
+	if rt == nil {
+		return
+	}
+
+	selfKey := kb.ConvertPeerID(dm.host.ID())
+	closestPeers := rt.NearestPeers(selfKey, 8)
+
+	var wg sync.WaitGroup
+	for _, pid := range closestPeers {
+		wg.Add(1)
+		go func(p peer.ID) {
+			defer wg.Done()
+			if dm.host.Network().Connectedness(p) != network.Connected {
+				addrs := dm.host.Peerstore().Addrs(p)
+				if len(addrs) > 0 {
+					ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					defer cancel()
+					dm.host.Connect(ctx, peer.AddrInfo{ID: p, Addrs: addrs})
+				}
+			}
+		}(pid)
+	}
+	wg.Wait()
+
+	dm.findAndConnectPeers(ctx, "krelay-service", 10)
+}
+
+func (dm *DiscoveryManager) runPeerExchange(ctx context.Context) {
+	dm.host.SetStreamHandler(peerExchangeProtocol, dm.handlePeerExchange)
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dm.initiatePeerExchange(ctx)
+		}
+	}
+}
+
+func (dm *DiscoveryManager) handlePeerExchange(s network.Stream) {
+	defer s.Close()
+
+	var knownPeers []peer.AddrInfo
+	if err := json.NewDecoder(s).Decode(&knownPeers); err != nil {
+		dm.logger.Error("Failed to decode peer exchange", zap.Error(err))
+		return
+	}
+
+	dm.processDiscoveredPeers(knownPeers)
+
+	ourPeers := dm.getCacheSnapshot()
+	if err := json.NewEncoder(s).Encode(ourPeers); err != nil {
+		dm.logger.Error("Failed to encode peer exchange", zap.Error(err))
+	}
+}
+
+func (dm *DiscoveryManager) initiatePeerExchange(ctx context.Context) {
+	peers := dm.host.Network().Peers()
+	if len(peers) == 0 {
+		return
+	}
+
+	targetPeers := dm.selectBestPeers(peers, 5)
+
+	var wg sync.WaitGroup
+	for _, p := range targetPeers {
+		wg.Add(1)
+		go func(pid peer.ID) {
+			defer wg.Done()
+			dm.exchangePeersWithPeer(ctx, pid)
+		}(p)
+	}
+	wg.Wait()
+}
+
+func (dm *DiscoveryManager) exchangePeersWithPeer(ctx context.Context, pid peer.ID) {
+	s, err := dm.host.NewStream(ctx, pid, peerExchangeProtocol)
+	if err != nil {
+		return
+	}
+	defer s.Close()
+
+	ourPeers := dm.getCacheSnapshot()
+	if err := json.NewEncoder(s).Encode(ourPeers); err != nil {
+		return
+	}
+
+	var theirPeers []peer.AddrInfo
+	if err := json.NewDecoder(s).Decode(&theirPeers); err != nil {
+		return
+	}
+
+	dm.processDiscoveredPeers(theirPeers)
+}
+
+func (dm *DiscoveryManager) selectBestPeers(peers []peer.ID, count int) []peer.ID {
+	if len(peers) <= count {
+		return peers
+	}
+
+	// Simple selection - could be enhanced with proper scoring
+	return peers[:count]
+}
+
+func (dm *DiscoveryManager) runLatencyBasedDiscovery(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dm.findLowLatencyPeers(ctx)
+		}
+	}
+}
+
+func (dm *DiscoveryManager) findLowLatencyPeers(ctx context.Context) {
+	peers := dm.host.Network().Peers()
+	latencies := make(map[peer.ID]time.Duration)
+
+	var wg sync.WaitGroup
+	var mx sync.Mutex
+
+	for _, p := range peers {
+		wg.Add(1)
+		go func(pid peer.ID) {
+			defer wg.Done()
+			latency := dm.measurePeerLatency(pid)
+			if latency > 0 {
+				mx.Lock()
+				latencies[pid] = latency
+				mx.Unlock()
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	if len(latencies) > 0 {
+		dm.findRegionalPeers(ctx, latencies)
+	}
+}
+
+func (dm *DiscoveryManager) measurePeerLatency(pid peer.ID) time.Duration {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	stream, err := dm.host.NewStream(ctx, pid, pingProtocol)
+	if err != nil {
+		return 0
+	}
+	defer stream.Close()
+
+	if _, err := stream.Write([]byte("ping")); err != nil {
+		return 0
+	}
+
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		return 0
+	}
+
+	return time.Since(start)
+}
+
+func (dm *DiscoveryManager) findRegionalPeers(ctx context.Context, latencies map[peer.ID]time.Duration) {
+	// Simplified regional peer discovery
+	// In a real implementation, this would use geolocation or similar
+	var regionalPeers []peer.ID
+	for pid, latency := range latencies {
+		if latency < 100*time.Millisecond {
+			regionalPeers = append(regionalPeers, pid)
+		}
+	}
+
+	if len(regionalPeers) > 0 {
+		dm.logger.Info("Found regional peers",
+			zap.Int("count", len(regionalPeers)),
+			zap.Duration("avg_latency", dm.averageLatency(latencies)))
+	}
+}
+
+func (dm *DiscoveryManager) averageLatency(latencies map[peer.ID]time.Duration) time.Duration {
+	var total time.Duration
+	for _, l := range latencies {
+		total += l
+	}
+	return total / time.Duration(len(latencies))
+}
+
+func (dm *DiscoveryManager) monitorNetworkQuality(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			quality := dm.assessNetworkQuality()
+			dm.adjustDiscoveryParameters(quality)
+		}
+	}
+}
+
+func (dm *DiscoveryManager) assessNetworkQuality() float64 {
+	peers := dm.host.Network().Peers()
+	if len(peers) == 0 {
+		return 0
+	}
+
+	var successRate float64
+	for _, p := range peers {
+		if dm.host.Network().Connectedness(p) == network.Connected {
+			successRate += 1
+		}
+	}
+	successRate /= float64(len(peers))
+
+	return successRate
+}
+
+func (dm *DiscoveryManager) adjustDiscoveryParameters(quality float64) {
+	// Simplified adjustment - could be enhanced
+	if quality < 0.5 {
+		dm.logger.Warn("Network quality poor", zap.Float64("quality", quality))
+	} else if quality > 0.8 {
+		dm.logger.Info("Network quality good", zap.Float64("quality", quality))
+	}
+}
+
+func (dm *DiscoveryManager) processDiscoveredPeers(peers []peer.AddrInfo) {
+	 dm.peerCacheMx.Lock()
+    defer dm.peerCacheMx.Unlock()
+
+    for _, pi := range peers {
+        if pi.ID == dm.host.ID() || !dm.peerFilter(pi) {
+            continue
+        }
+
+        dm.peerCache.Add(pi.ID, &peerCacheEntryData{
+            addrs:      pi.Addrs,
+            discovered: time.Now(),
+        }, peerAdvertisementTTL)
+
+        dm.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.TempAddrTTL)
+    }
+}
+
+func (dm *DiscoveryManager) processDiscoveredPeer(pi peer.AddrInfo) {
+	dm.peerCacheMx.Lock()
+	defer dm.peerCacheMx.Unlock()
+
+	dm.peerCache.Add(pi.ID, &peerCacheEntryData{
+		addrs:      pi.Addrs,
+		discovered: time.Now(),
+	},time.Duration(peerAdvertisementTTL))
+
+	dm.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.TempAddrTTL)
+}
+
+func (dm *DiscoveryManager) getCacheSnapshot() []peer.AddrInfo {
+    dm.peerCacheMx.Lock()
+    defer dm.peerCacheMx.Unlock()
+
+    var peers []peer.AddrInfo
+    for _, pid := range dm.peerCache.Keys() {
+        if entry, exists := dm.peerCache.Get(pid); exists {
+            peers = append(peers, peer.AddrInfo{
+                ID:    pid,
+                Addrs: entry.addrs,
+            })
+        }
+    }
+    return peers
+}
+
+func (dm *DiscoveryManager) runPeerCacheMaintenance(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dm.cleanPeerCache()
+		}
+	}
+}
+
+func (dm *DiscoveryManager) cleanPeerCache() {
+    dm.peerCacheMx.Lock()
+    defer dm.peerCacheMx.Unlock()
+    dm.peerCache.CleanExpired()
+}
+func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	n.logger.Info("Discovered peer via mDNS", zap.String("peer", pi.ID.String()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := n.h.Connect(ctx, pi); err != nil {
+		n.logger.Error("Failed to connect to discovered peer",
+			zap.String("peer", pi.ID.String()),
+			zap.Error(err),
+		)
+	}
 }
 
 func NewStateManager(cfg *Config, logger *zap.Logger) *StateManager {
@@ -461,26 +1091,6 @@ func (sm *StateManager) PeriodicSave(ctx context.Context, h host.Host, dht *kadd
 			}
 		}
 	}
-}
-
-type BridgeMapping struct {
-	ProtocolA      protocol.ID
-	ProtocolB      protocol.ID
-	HandlerA       network.StreamHandler
-	HandlerB       network.StreamHandler
-	Active         bool
-	SuccessCount   uint64
-	FailureCount   uint64
-	AvgLatency     time.Duration
-	LastUsed       time.Time
-}
-
-type ProtocolBridge struct {
-	host         host.Host
-	logger       *zap.Logger
-	bridges      map[string]*BridgeMapping
-	bridgesLock  sync.RWMutex
-	capabilities []ProtocolCapability
 }
 
 func NewProtocolBridge(h host.Host, logger *zap.Logger) *ProtocolBridge {
@@ -795,30 +1405,6 @@ func (pb *ProtocolBridge) NegotiateWithPeer(ctx context.Context, pid peer.ID, pr
 	return protocol.ID(selected.ProtocolID), nil
 }
 
-type ConnectionScore struct {
-	PeerID           peer.ID
-	LastActivity     time.Time
-	BytesTransferred uint64
-	Latency         time.Duration
-	Stability       float64
-	Priority        ConnectionPriority
-}
-
-type ConnectionManager struct {
-	host              host.Host
-	logger            *zap.Logger
-	maxConnections    int
-	priorityPeers     map[peer.ID]ConnectionPriority
-	connectionLimiter chan struct{}
-	maintenanceTicker *time.Ticker
-	metrics           struct {
-		totalConnections    atomic.Int32
-		inboundConnections atomic.Int32
-		outboundConnections atomic.Int32
-	}
-	scoreMutex sync.Mutex
-}
-
 func NewConnectionManager(h host.Host, maxConns int, logger *zap.Logger) *ConnectionManager {
 	if maxConns <= 0 {
 		maxConns = defaultMaxConnections
@@ -1037,7 +1623,6 @@ func (cm *ConnectionManager) runMaintenance(ctx context.Context) {
 }
 
 func (cm *ConnectionManager) IsConnected(p peer.ID) bool {
-
 	return cm.host.Network().Connectedness(p) == network.Connected
 }
 
@@ -1048,109 +1633,6 @@ func (cm *ConnectionManager) GetConnectionStats() map[string]interface{} {
 		"outbound": cm.metrics.outboundConnections.Load(),
 		"limit":    cm.maxConnections,
 	}
-}
-
-type DiscoveryManager struct {
-	host      host.Host
-	dht       *kaddht.IpfsDHT
-	mdns      mdns.Service
-	discovery *routingdiscovery.RoutingDiscovery
-	logger    *zap.Logger
-}
-
-func NewDiscoveryManager(h host.Host, dht *kaddht.IpfsDHT, logger *zap.Logger) *DiscoveryManager {
-	return &DiscoveryManager{
-		host:      h,
-		dht:       dht,
-		mdns:      mdns.NewMdnsService(h, "krelay", &mdnsNotifee{h: h, logger: logger}),
-		discovery: routingdiscovery.NewRoutingDiscovery(dht),
-		logger:    logger,
-	}
-}
-
-func (dm *DiscoveryManager) Start(ctx context.Context) {
-	if err := dm.mdns.Start(); err != nil {
-		dm.logger.Error("Failed to start mDNS", zap.Error(err))
-	}
-
-	go dm.advertiseService(ctx)
-	go dm.findPeers(ctx)
-}
-
-func (dm *DiscoveryManager) advertiseService(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			util.Advertise(ctx, dm.discovery, "krelay-service")
-		}
-	}
-}
-
-func (dm *DiscoveryManager) findPeers(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			peerChan, err := dm.discovery.FindPeers(ctx, "krelay-service")
-			if err != nil {
-				dm.logger.Info("Failed to find peers", zap.Error(err))
-				continue
-			}
-
-			for p := range peerChan {
-				if p.ID == dm.host.ID() {
-					continue
-				}
-				dm.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.TempAddrTTL)
-				dm.logger.Info("Discovered peer", zap.String("peer", p.ID.String()))
-			}
-		}
-	}
-}
-
-type mdnsNotifee struct {
-	h      host.Host
-	logger *zap.Logger
-}
-
-func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	n.logger.Info("Discovered peer via mDNS", zap.String("peer", pi.ID.String()))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := n.h.Connect(ctx, pi); err != nil {
-		n.logger.Error("Failed to connect to discovered peer",
-			zap.String("peer", pi.ID.String()),
-			zap.Error(err),
-		)
-	}
-}
-
-type KademliaRelay struct {
-	host        host.Host
-	dht         *kaddht.IpfsDHT
-	discovery   *DiscoveryManager
-	bridge      *ProtocolBridge
-	relay       *relay.Relay
-	pubsub      *PubSubManager
-	config      *Config
-	logger      *zap.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
-	apiServer   *http.Server
-	stateMgr    *StateManager
-	connManager *ConnectionManager
-	lastSeen    sync.Map
 }
 
 func NewKademliaRelay(ctx context.Context, cfg *Config, logger *zap.Logger) (*KademliaRelay, error) {
@@ -1312,7 +1794,26 @@ func NewKademliaRelay(ctx context.Context, cfg *Config, logger *zap.Logger) (*Ka
 	go node.stateMgr.PeriodicSave(ctx, h, dht)
 	go node.connManager.runMaintenance(ctx)
 
+	// Add enhanced discovery protocols
+	h.SetStreamHandler(peerExchangeProtocol, node.handlePeerExchange)
+	h.SetStreamHandler(pingProtocol, node.handlePing)
+
 	return node, nil
+}
+
+func (kr *KademliaRelay) handlePeerExchange(s network.Stream) {
+	kr.discovery.handlePeerExchange(s)
+}
+
+func (kr *KademliaRelay) handlePing(s network.Stream) {
+	defer s.Close()
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(s, buf); err != nil {
+		return
+	}
+	if string(buf) == "ping" {
+		s.Write([]byte("pong"))
+	}
 }
 
 func (kr *KademliaRelay) Start() error {
@@ -1926,6 +2427,7 @@ func DefaultConfig() *Config {
 		PeerstoreCleanupEnabled:  true,
 		PeerstoreCleanupInterval: "1h",
 		MaxConnections:           defaultMaxConnections,
+		EnableEnhancedDiscovery:  true,
 		DefaultBridges: [][]string{
 			{"/chat/1.0.0", "/chat/2.0.0"},
 			{"/file-transfer/1.0", "/file-transfer/2.0"},
