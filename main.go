@@ -1,7 +1,6 @@
 package main
 
 import (
-
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -20,9 +19,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-        "container/list"
+	"container/list"
 
 	"github.com/gorilla/mux"
+	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -514,6 +514,12 @@ func defaultPeerFilter(pi peer.AddrInfo) bool {
 func isDevMode() bool {
 	return os.Getenv("DEV_MODE") == "1"
 }
+func (cm *ConnectionManager) StartDiscoveryPhase() {
+    cm.maxConnections = cm.maxConnections * 2
+    time.AfterFunc(30*time.Minute, func() {
+        cm.maxConnections = cm.maxConnections /2
+    })
+}
 
 func (dm *DiscoveryManager) Start(ctx context.Context) {
 	if err := dm.mdns.Start(); err != nil {
@@ -525,12 +531,27 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 	go dm.runPeerCacheMaintenance(ctx)
 	go dm.runLatencyBasedDiscovery(ctx)
 	go dm.monitorNetworkQuality(ctx)
+	go dm.runRandomWalkDiscovery(ctx)
 }
+func (dm *DiscoveryManager) runRandomWalkDiscovery(ctx context.Context) {
+    ticker := time.NewTicker(10 * time.Second)
+    //defer ticker.Stop()
 
+    for {
+        select {
+        case <-ctx.Done(): return
+        case <-ticker.C:
+            // Query random keys to populate routing table
+            key := make([]byte, 32)
+            rand.Read(key)
+            dm.dht.GetClosestPeers(ctx, string(key))
+        }
+    }
+}
 func (dm *DiscoveryManager) runOptimizedDHTDiscovery(ctx context.Context) {
 	dm.bootstrappedDiscovery(ctx)
 
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -627,7 +648,7 @@ func (dm *DiscoveryManager) efficientFindPeers(ctx context.Context) {
 func (dm *DiscoveryManager) runPeerExchange(ctx context.Context) {
 	dm.host.SetStreamHandler(peerExchangeProtocol, dm.handlePeerExchange)
 
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -1523,6 +1544,7 @@ func (cm *ConnectionManager) scoreConnections() map[peer.ID]ConnectionScore {
 			Priority:        priority,
 			Stability:       calculateStability(p, cm.host),
 		}
+
 	}
 
 	return scores
@@ -1704,11 +1726,14 @@ func NewKademliaRelay(ctx context.Context, cfg *Config, logger *zap.Logger) (*Ka
 		return nil, fmt.Errorf("DHT initialization failed: %w", err)
 	}
 
-	if err := dht.Bootstrap(ctx); err != nil {
-		cancel()
-		h.Close()
-		return nil, fmt.Errorf("DHT bootstrap failed: %w", err)
-	}
+	// After successful bootstrap:
+if err := dht.Bootstrap(ctx); err == nil {
+    // Advertise our availability
+    routingdiscovery.NewRoutingDiscovery(dht).Advertise(ctx, "krelay-service")
+
+    // Join the public DHT peer list
+
+}
 
 	node := &KademliaRelay{
 		host:     h,
@@ -2038,8 +2063,255 @@ func (kr *KademliaRelay) setupAPI() *mux.Router {
 	r.HandleFunc("/api/v1/pubsub/topics/{topic}/publish", kr.publishToTopic).Methods("POST")
 	r.HandleFunc("/api/v1/pubsub/topics/{topic}/subscribe", kr.subscribeToTopic).Methods("POST")
 	r.HandleFunc("/api/v1/pubsub/topics/{topic}/peers", kr.listTopicPeers).Methods("GET")
+        r.HandleFunc("/debug/peers", func(w http.ResponseWriter, r *http.Request) {
+    peers := kr.host.Network().Peers()
+    fmt.Fprintf(w, "Connected: %d\n", len(peers))
 
+    rt := kr.dht.RoutingTable()
+    fmt.Fprintf(w, "Routing Table: %d\n", rt.Size())
+
+    // List all peers with connection details
+    for _, p := range peers {
+        fmt.Fprintf(w, "- %s: %v\n", p, kr.host.Network().ConnsToPeer(p))
+    }
+})
+	r.HandleFunc("/api/v1/dht/peers", kr.listDHTNodesHandler).Methods("GET")
+	r.HandleFunc("/api/v1/dht/routing", kr.getRoutingTableHandler).Methods("GET")
+	r.HandleFunc("/api/v1/dht/query/{key}", kr.dhtQueryHandler).Methods("GET")
+	r.HandleFunc("/api/v1/dht/provide/{cid}", kr.dhtProvideHandler).Methods("POST")
+	r.HandleFunc("/api/v1/dht/findprovs/{cid}", kr.dhtFindProvidersHandler).Methods("GET")
+	r.HandleFunc("/api/v1/dht/findpeer/{peerID}", kr.dhtFindPeerHandler).Methods("GET")
+	r.HandleFunc("/api/v1/dht/get/{key}", kr.dhtGetValueHandler).Methods("GET")
+	r.HandleFunc("/api/v1/dht/put/{key}", kr.dhtPutValueHandler).Methods("POST")
+	r.HandleFunc("/api/v1/dht/bootstrap", kr.dhtBootstrapHandler).Methods("POST")
+	r.HandleFunc("/api/v1/dht/metrics", kr.dhtMetricsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/dht/closest/{key}", kr.dhtClosestPeersHandler).Methods("GET")
 	return r
+}
+// DHT Handlers Implementation
+
+func (kr *KademliaRelay) listDHTNodesHandler(w http.ResponseWriter, r *http.Request) {
+	peers := kr.dht.RoutingTable().ListPeers()
+	peerInfos := make([]peer.AddrInfo, 0, len(peers))
+
+	for _, p := range peers {
+		peerInfos = append(peerInfos, peer.AddrInfo{
+			ID:    p,
+			Addrs: kr.host.Peerstore().Addrs(p),
+		})
+	}
+
+	respondWithJSON(w, http.StatusOK, peerInfos)
+}
+
+func (kr *KademliaRelay) getRoutingTableHandler(w http.ResponseWriter, r *http.Request) {
+	rt := kr.dht.RoutingTable()
+	info := map[string]interface{}{
+		"size":           rt.Size(),
+		"peerCount":      len(rt.ListPeers()),
+		"nearestPeers":   rt.NearestPeers(kb.ConvertPeerID(kr.host.ID()), 10),
+	}
+	respondWithJSON(w, http.StatusOK, info)
+}
+
+func (kr *KademliaRelay) dhtQueryHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	key := vars["key"]
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	peers, err := kr.dht.GetClosestPeers(ctx, key)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	peerInfos := make([]peer.AddrInfo, 0, len(peers))
+	for _, p := range peers {
+		peerInfos = append(peerInfos, peer.AddrInfo{
+			ID:    p,
+			Addrs: kr.host.Peerstore().Addrs(p),
+		})
+	}
+
+	respondWithJSON(w, http.StatusOK, peerInfos)
+}
+
+func (kr *KademliaRelay) dhtProvideHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	cidStr := vars["cid"]
+
+	cid, err := cid.Decode(cidStr)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid CID format")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	err = kr.dht.Provide(ctx, cid, true)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]string{"status": "content provided"})
+}
+
+func (kr *KademliaRelay) dhtFindProvidersHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	cidStr := vars["cid"]
+
+	cid, err := cid.Decode(cidStr)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid CID format")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	providers := kr.dht.FindProvidersAsync(ctx, cid, 10)
+	var results []peer.AddrInfo
+
+	for p := range providers {
+		results = append(results, p)
+	}
+
+	respondWithJSON(w, http.StatusOK, results)
+}
+
+func (kr *KademliaRelay) dhtFindPeerHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	peerIDStr := vars["peerID"]
+
+	pid, err := peer.Decode(peerIDStr)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid peer ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	addr, err := kr.dht.FindPeer(ctx, pid)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, addr)
+}
+
+func (kr *KademliaRelay) dhtGetValueHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	key := vars["key"]
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	val, err := kr.dht.GetValue(ctx, key)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"key":   key,
+		"value": string(val),
+	})
+}
+
+func (kr *KademliaRelay) dhtPutValueHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	key := vars["key"]
+
+	var req struct {
+		Value string `json:"value"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	err := kr.dht.PutValue(ctx, key, []byte(req.Value))
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]string{"status": "value stored"})
+}
+
+func (kr *KademliaRelay) dhtBootstrapHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	err := kr.dht.Bootstrap(ctx)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]string{"status": "bootstrapped"})
+}
+
+func (kr *KademliaRelay) dhtMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	rt := kr.dht.RoutingTable()
+	metrics := map[string]interface{}{
+		"routingTableSize": rt.Size(),
+		"peerCount":       len(rt.ListPeers()),
+		}
+	respondWithJSON(w, http.StatusOK, metrics)
+}
+
+func (kr *KademliaRelay) dhtClosestPeersHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	key := vars["key"]
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	peers, err := kr.dht.GetClosestPeers(ctx, key)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	peerInfos := make([]peer.AddrInfo, 0, len(peers))
+	for _, p := range peers {
+		peerInfos = append(peerInfos, peer.AddrInfo{
+			ID:    p,
+			Addrs: kr.host.Peerstore().Addrs(p),
+		})
+	}
+
+	respondWithJSON(w, http.StatusOK, peerInfos)
+}
+
+// Helper functions (add these if not already present)
+
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	response, err := json.Marshal(payload)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"failed to marshal response"}`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(response)
+}
+
+func respondWithError(w http.ResponseWriter, code int, message string) {
+	respondWithJSON(w, code, map[string]string{"error": message})
 }
 
 func (kr *KademliaRelay) listPeersHandler(w http.ResponseWriter, r *http.Request) {
@@ -2362,22 +2634,6 @@ func multiAddrsToStrings(addrs []multiaddr.Multiaddr) []string {
 	return strs
 }
 
-func respondWithError(w http.ResponseWriter, code int, message string) {
-	respondWithJSON(w, code, map[string]string{"error": message})
-}
-
-func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	response, err := json.Marshal(payload)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error":"failed to marshal response"}`))
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	w.Write(response)
-}
 
 func loadOrCreatePrivateKey(path string) (crypto.PrivKey, error) {
 	if _, err := os.Stat(path); err == nil {
@@ -2418,6 +2674,15 @@ func DefaultConfig() *Config {
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
 			"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+		        "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+			"/ip4/178.128.142.94/tcp/4001/p2p/QmWjQz5Qj8mgb7gL3t4eXJyXKYTA5KY1QknDdjYVx61V6X",
+			"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+
+	                "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+	                "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+	                "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8", // js-libp2p-amino-dht-bootstrapper
+	                "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",           // mars.i.ipfs.io
+	                "/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",   // mars.i.ipfs.io
 		},
 		EnableRelay:              true,
 		EnableAutoRelay:          true,
